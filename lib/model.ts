@@ -558,6 +558,89 @@ export function parseSnapshot(text: string): Snapshot {
   };
 }
 
+/**
+ * Deep validation of a parsed snapshot: every figure the model scores must be present and sane,
+ * and every watchlist slug must name a protocol the snapshot carries. parseSnapshot refuses
+ * malformed JSON; this refuses well-formed data the model cannot defend, so a corrupt or
+ * half-written snapshot fails here with a named record instead of silently scoring nonsense.
+ * Throws SnapshotError naming the first bad record found.
+ */
+export function validateSnapshot(snapshot: Snapshot): void {
+  if (snapshot.protocols.length === 0) {
+    throw new SnapshotError('snapshot.json carries no protocols');
+  }
+  if (snapshot.watchlist.length === 0) {
+    throw new SnapshotError('snapshot.json carries an empty watchlist');
+  }
+  if (!Number.isFinite(snapshot.floor_usd) || snapshot.floor_usd <= 0) {
+    throw new SnapshotError(`snapshot.json floor_usd is ${snapshot.floor_usd}`);
+  }
+  const asOfMs = Date.parse(`${snapshot.as_of}T00:00:00Z`);
+  if (!Number.isFinite(asOfMs)) {
+    throw new SnapshotError(`snapshot.json as_of ${snapshot.as_of} is not a date`);
+  }
+  const watchlistSeen = new Set<string>();
+  for (const slug of snapshot.watchlist) {
+    if (slug.length === 0) {
+      throw new SnapshotError('snapshot.json watchlist carries an empty slug');
+    }
+    if (watchlistSeen.has(slug)) {
+      throw new SnapshotError(`snapshot.json watchlist repeats the slug ${slug}`);
+    }
+    watchlistSeen.add(slug);
+  }
+  const slugs = new Set<string>();
+  for (const p of snapshot.protocols) {
+    if (p.slug.length === 0) {
+      throw new SnapshotError('snapshot.json carries a protocol with an empty slug');
+    }
+    if (slugs.has(p.slug)) {
+      throw new SnapshotError(`snapshot.json repeats the slug ${p.slug}`);
+    }
+    slugs.add(p.slug);
+    if (p.name.length === 0) {
+      throw new SnapshotError(`snapshot.json protocol ${p.slug} has an empty name`);
+    }
+    if (typeof p.category !== 'string' && p.category !== null) {
+      throw new SnapshotError(`snapshot.json protocol ${p.slug} has a category that is not a string`);
+    }
+    if (!Number.isFinite(p.tvl_usd) || p.tvl_usd < 0) {
+      throw new SnapshotError(`snapshot.json protocol ${p.slug} has TVL ${p.tvl_usd}`);
+    }
+    if (p.change_7d !== null && (!Number.isFinite(p.change_7d) || p.change_7d < -100 || p.change_7d > 10000)) {
+      throw new SnapshotError(`snapshot.json protocol ${p.slug} has 7d change ${p.change_7d}`);
+    }
+    // A market cap must be a number when present; a non-positive one is DefiLlama's way of
+    // saying "unknown" (the sealed snapshot records -1 for it), and the model already treats
+    // any non-positive market cap as absent, so it is tolerated here too.
+    if (p.mcap_usd !== null && !Number.isFinite(p.mcap_usd)) {
+      throw new SnapshotError(`snapshot.json protocol ${p.slug} has market cap ${p.mcap_usd}`);
+    }
+    if (p.listed_at !== null) {
+      const listedMs = Date.parse(`${p.listed_at}T00:00:00Z`);
+      if (!Number.isFinite(listedMs)) {
+        throw new SnapshotError(`snapshot.json protocol ${p.slug} has listed_at ${p.listed_at}`);
+      }
+    }
+    const chainsSeen = new Set<string>();
+    for (const chain of p.chains) {
+      if (chain.length === 0) {
+        throw new SnapshotError(`snapshot.json protocol ${p.slug} names an empty chain`);
+      }
+      if (chainsSeen.has(chain)) {
+        throw new SnapshotError(`snapshot.json protocol ${p.slug} repeats the chain ${chain}`);
+      }
+      chainsSeen.add(chain);
+    }
+  }
+  const missing = snapshot.watchlist.filter((slug) => !slugs.has(slug));
+  if (missing.length > 0) {
+    throw new SnapshotError(
+      `snapshot.json watchlist names ${missing.length} slug${missing.length === 1 ? '' : 's'} the snapshot does not carry: ${missing.slice(0, 5).join(', ')}`,
+    );
+  }
+}
+
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
   const slugs = new Set(board.map((r) => r.slug));
@@ -576,6 +659,101 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
   }
   return null;
+}
+
+/** The gate's cap on one row's implied value, in dollars (RULES.txt, The gate). */
+export const IMPLIED_VALUE_MAX_USD = 100_000_000_000_000;
+
+/**
+ * Deep validation of a built board: ranks, order, implied values, farm steps, model
+ * multipliers, and coverage, each re-derived from the snapshot instead of trusted from the
+ * board itself. boardIssue reports the first gate refusal as a string; this throws a
+ * SnapshotError naming the first row that fails any check, including checks the gate's
+ * own rows do not spell out (multiplier ranges, recomputed implied values, age agreement).
+ */
+export function validateBoard(board: BoardRow[], snapshot: Snapshot): void {
+  if (board.length < 100 || board.length > 4000) {
+    throw new SnapshotError(`the board has ${board.length} rows: the gate takes 100 to 4000`);
+  }
+  const { byCategory, overall } = categoryMultiples(snapshot, MODEL);
+  const multipleFor = (p: SnapshotProtocol): number => byCategory.get(p.category ?? 'Other') ?? overall;
+  const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+  const watchlist = new Set(snapshot.watchlist);
+  const seenSlugs = new Set<string>();
+  let totalImplied = 0;
+  for (let i = 0; i < board.length; i++) {
+    const row = board[i]!;
+    if (row.rank !== i + 1) {
+      throw new SnapshotError(`board row ${i + 1} carries rank ${row.rank}: ranks must run 1..${board.length} in order`);
+    }
+    if (i > 0 && row.implied_value_usd > board[i - 1]!.implied_value_usd) {
+      throw new SnapshotError(`board row ${row.slug} at rank ${row.rank} outranks row ${board[i - 1]!.slug} on implied value`);
+    }
+    if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd < 1 || row.implied_value_usd > IMPLIED_VALUE_MAX_USD) {
+      throw new SnapshotError(`board row ${row.slug} has implied value ${row.implied_value_usd}: the gate caps one row at $${IMPLIED_VALUE_MAX_USD}`);
+    }
+    if (seenSlugs.has(row.slug)) {
+      throw new SnapshotError(`the board repeats the slug ${row.slug}`);
+    }
+    seenSlugs.add(row.slug);
+    const protocol = index.get(row.slug);
+    if (protocol === undefined) {
+      throw new SnapshotError(`board row ${row.slug} names a protocol the snapshot does not carry`);
+    }
+    if (row.token_status !== 'pre-token') {
+      throw new SnapshotError(`board row ${row.slug} has token status ${row.token_status}`);
+    }
+    if (row.name !== protocol.name || row.tvl_usd !== protocol.tvl_usd) {
+      throw new SnapshotError(`board row ${row.slug} disagrees with the snapshot on its name or TVL`);
+    }
+    if (row.model.age_days !== ageDays(snapshot.as_of, protocol.listed_at)) {
+      throw new SnapshotError(`board row ${row.slug} has age ${row.model.age_days} days: the snapshot says ${ageDays(snapshot.as_of, protocol.listed_at)}`);
+    }
+    if (row.model.category_multiple < MODEL.multiple_min || row.model.category_multiple > MODEL.multiple_max) {
+      throw new SnapshotError(`board row ${row.slug} has category multiple ${row.model.category_multiple}: the model clamps it to [${MODEL.multiple_min}, ${MODEL.multiple_max}]`);
+    }
+    if (row.model.growth_multiplier < 0.7 || row.model.growth_multiplier > 1.6) {
+      throw new SnapshotError(`board row ${row.slug} has growth multiplier ${row.model.growth_multiplier}: the model clamps it to [0.7, 1.6]`);
+    }
+    if (row.model.growth_pct < MODEL.growth_floor || row.model.growth_pct > MODEL.growth_cap) {
+      throw new SnapshotError(`board row ${row.slug} has growth ${row.model.growth_pct}%: the model clamps it to [${MODEL.growth_floor}, ${MODEL.growth_cap}]`);
+    }
+    if (row.model.maturity_multiplier < MODEL.maturity_floor || row.model.maturity_multiplier > 1) {
+      throw new SnapshotError(`board row ${row.slug} has maturity multiplier ${row.model.maturity_multiplier}: the model clamps it to [${MODEL.maturity_floor}, 1]`);
+    }
+    if (row.model.breadth_multiplier < 1 || row.model.breadth_multiplier > 1.2) {
+      throw new SnapshotError(`board row ${row.slug} has breadth multiplier ${row.model.breadth_multiplier}: the model clamps it to [1, 1.2]`);
+    }
+    const recomputed = impliedValue(protocol, snapshot.as_of, MODEL, multipleFor(protocol));
+    if (recomputed.implied !== row.implied_value_usd) {
+      throw new SnapshotError(`board row ${row.slug} has implied value $${row.implied_value_usd}: recomputing from the snapshot gives $${recomputed.implied}`);
+    }
+    if (recomputed.growthMult !== row.model.growth_multiplier || recomputed.maturityMult !== row.model.maturity_multiplier || recomputed.breadthMult !== row.model.breadth_multiplier) {
+      throw new SnapshotError(`board row ${row.slug} has multipliers that disagree with a recomputation from the snapshot`);
+    }
+    if (!watchlist.has(row.slug) && !isRankable(protocol)) {
+      throw new SnapshotError(`board row ${row.slug} is not a rankable protocol and is not on the watchlist`);
+    }
+    if (row.farm_steps.length < 3 || row.farm_steps.length > 12) {
+      throw new SnapshotError(`board row ${row.slug} has ${row.farm_steps.length} farm steps: the gate takes 3 to 12`);
+    }
+    for (const step of row.farm_steps) {
+      if (step.length < 20 || step.length > 600) {
+        throw new SnapshotError(`board row ${row.slug} has a farm step of ${step.length} characters: the gate takes 20 to 600`);
+      }
+      if (!step.includes('Cost:') || !step.includes('Time:')) {
+        throw new SnapshotError(`board row ${row.slug} has a farm step without its cost and time`);
+      }
+    }
+    totalImplied += row.implied_value_usd;
+  }
+  if (!Number.isFinite(totalImplied) || totalImplied <= 0) {
+    throw new SnapshotError(`the board's total implied value is ${totalImplied}`);
+  }
+  const missing = snapshot.watchlist.filter((slug) => !seenSlugs.has(slug));
+  if (missing.length > 0) {
+    throw new SnapshotError(`the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`);
+  }
 }
 
 /** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
