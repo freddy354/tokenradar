@@ -16,10 +16,13 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, parseSnapshot, validateBoard, validateSnapshot } from './lib/model.ts';
+import type { BoardRow, RadarData, Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
+/** Wall-clock start: the diagnostics summary reports the run's own runtime. */
+const startedAt = Date.now();
 
 /** The scorer's own caps (RULES.txt, The gate): the text cap shapes the bytes, the rest refuse. */
 const TEXT_MAX_BYTES = 65_536;
@@ -34,6 +37,39 @@ function arg(name: string, fallback: string): string {
   return withEquals === undefined ? fallback : withEquals.slice(name.length + 3);
 }
 
+/**
+ * --explain <slug>: print one protocol's full model breakdown to stdout — its rank, its
+ * four multipliers, the implied-value arithmetic, and its farm plan — then stop before any
+ * output is written. A diagnostic only: it never touches /output.
+ */
+function printExplain(board: BoardRow[], slug: string): void {
+  const row = board.find((r) => r.slug === slug);
+  if (row === undefined) {
+    process.stderr.write(`token radar: --explain ${slug}: no board row carries that slug\n`);
+    process.exit(2);
+  }
+  const usd = (n: number): string => `$${n.toLocaleString('en-US')}`;
+  const lines: string[] = [];
+  lines.push(`token radar: ${row.name} (${row.slug})`);
+  lines.push(`  rank: #${row.rank} of ${board.length} — ${row.token_status}`);
+  lines.push(`  category: ${row.category ?? 'Other'} — chains: ${row.chains.length > 0 ? row.chains.join(', ') : 'none recorded'}`);
+  lines.push(`  TVL: ${usd(row.tvl_usd)} — 7d change: ${row.change_7d === null ? 'not recorded' : `${row.change_7d.toFixed(2)}%`} — age: ${row.age_days === null ? 'not recorded' : `${row.age_days} days`}`);
+  lines.push(`  model:`);
+  lines.push(`    category multiple: ${row.model.category_multiple} (median mcap/TVL of live-token protocols in ${row.category ?? 'Other'})`);
+  lines.push(`    growth: ${row.model.growth_pct}% over 7d -> multiplier ${row.model.growth_multiplier}`);
+  lines.push(`    maturity multiplier: ${row.model.maturity_multiplier} (age ${row.model.age_days === null ? 'unknown, 365 days assumed' : `${row.model.age_days} days`})`);
+  lines.push(`    breadth multiplier: ${row.model.breadth_multiplier} (${row.chains.length} chain${row.chains.length === 1 ? '' : 's'})`);
+  lines.push(`  implied value: ${usd(row.tvl_usd)} x ${row.model.category_multiple} x ${row.model.growth_multiplier} x ${row.model.maturity_multiplier} x ${row.model.breadth_multiplier} = ${usd(row.implied_value_usd)}`);
+  lines.push(`  farm plan (${row.farm_steps.length} steps):`);
+  for (let i = 0; i < row.farm_steps.length; i++) {
+    lines.push(`    ${i + 1}. ${row.farm_steps[i]}`);
+  }
+  const ahead = board.filter((r) => r.implied_value_usd > row.implied_value_usd).length;
+  const behind = board.filter((r) => r.implied_value_usd < row.implied_value_usd).length;
+  lines.push(`  board position: ${ahead} row${ahead === 1 ? '' : 's'} above, ${behind} below`);
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
 const inputArg = arg('input', '/input');
 const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
 if (!existsSync(inputFile)) {
@@ -43,12 +79,19 @@ if (!existsSync(inputFile)) {
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
+validateSnapshot(snapshot);
 const { board, radar } = buildRadar(snapshot);
+const explainSlug = arg('explain', '');
+if (explainSlug !== '') {
+  printExplain(board, explainSlug);
+  process.exit(0);
+}
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
   process.exit(1);
 }
+validateBoard(board, snapshot);
 
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
@@ -100,9 +143,40 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+/**
+ * The run's diagnostics summary, to stderr after a successful run: the board's category mix,
+ * watchlist coverage, the implied-value distribution in deciles, and the wall-clock runtime.
+ * Diagnostics only: nothing here touches /output or the board's bytes.
+ */
+function printDiagnostics(board: BoardRow[], radar: RadarData, snapshot: Snapshot, elapsedMs: number): void {
+  const lines: string[] = [];
+  const byCategory = new Map<string, number>();
+  for (const row of board) {
+    const key = row.category ?? 'Other';
+    byCategory.set(key, (byCategory.get(key) ?? 0) + 1);
+  }
+  const rankedCats = [...byCategory.entries()].sort((a, b) => b[1] - a[1]);
+  const shownCats = rankedCats.slice(0, 8);
+  const otherCats = rankedCats.slice(8).reduce((n, [, c]) => n + c, 0);
+  const catParts = shownCats.map(([cat, count]) => `${cat} ${count} (${((count / board.length) * 100).toFixed(1)}%)`);
+  if (otherCats > 0) catParts.push(`other ${otherCats} (${((otherCats / board.length) * 100).toFixed(1)}%)`);
+  lines.push(`token radar: categories: ${catParts.join(', ')}`);
+  const watchlist = new Set(snapshot.watchlist);
+  const covered = board.filter((r) => watchlist.has(r.slug)).length;
+  lines.push(`token radar: watchlist coverage: ${covered} of ${snapshot.watchlist.length} slugs on the board (${((covered / snapshot.watchlist.length) * 100).toFixed(1)}%)`);
+  const values = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
+  const at = (q: number): number => values[Math.min(values.length - 1, Math.floor(q * (values.length - 1)))]!;
+  const usd = (n: number): string => `$${n.toLocaleString('en-US')}`;
+  lines.push(`token radar: implied value deciles: min ${usd(values[0]!)} — p10 ${usd(at(0.1))} — p25 ${usd(at(0.25))} — median ${usd(at(0.5))} — p75 ${usd(at(0.75))} — p90 ${usd(at(0.9))} — max ${usd(values[values.length - 1]!)}`);
+  lines.push(`token radar: total implied value ${usd(radar.total_implied_usd)} across ${board.length} rows (${radar.early_size} early radar, ${radar.live_size} live set aside)`);
+  lines.push(`token radar: run time ${elapsedMs} ms (budget 120000 ms)`);
+  process.stderr.write(`${lines.join('\n')}\n`);
+}
+
 const top = board.slice(0, 5).map((r) => `#${r.rank} ${r.name} $${r.implied_value_usd.toLocaleString('en-US')}`).join(', ');
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
     `token radar: top 5: ${top}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'dashboard')} (${dashFiles.length + 1} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
+printDiagnostics(board, radar, snapshot, Date.now() - startedAt);
